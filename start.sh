@@ -1,2 +1,2 @@
 #!/bin/bash
-python3 EngClubBot.py
+python3 CBot.py

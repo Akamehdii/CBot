@@ -1,10 +1,12 @@
-# CBot.py  — English Club Registration Bot (Polling version)
-# Requires: python-telegram-bot==20.3
+# CBot.py — English Club Registration Bot (Webhook + FastAPI/Uvicorn)
+# Requires: python-telegram-bot==20.3, fastapi, uvicorn
 
 import os
 import json
 from datetime import datetime
+from contextlib import asynccontextmanager
 
+from fastapi import FastAPI, Request
 from telegram import (
     Update,
     InlineKeyboardButton, InlineKeyboardMarkup,
@@ -18,15 +20,16 @@ from telegram.ext import (
 # =========================
 #        SETTINGS
 # =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")                         # REQUIRED
-GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))       # admin group/channel id (negative for groups)
-SHEET_LINK = os.environ.get("SHEET_LINK", "")                   # optional
+BOT_TOKEN = os.environ.get("BOT_TOKEN")                       # REQUIRED
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")                   # REQUIRED (e.g. https://your-app.onrender.com)
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))     # admin group/channel id (negative for groups)
+SHEET_LINK = os.environ.get("SHEET_LINK", "")                 # optional
 
 # Google Sheets (optional)
-GSPREAD_CREDS_JSON = os.environ.get("GSPREAD_CREDS_JSON")       # JSON string
+GSPREAD_CREDS_JSON = os.environ.get("GSPREAD_CREDS_JSON")     # JSON string
 SHEET_NAME = os.environ.get("SHEET_NAME", "EnglishClubRegistrations")
 
-# EVENTS & PRIVATE LINKS
+# Events & links
 DEFAULT_EVENTS = [
     {
         "id": "m1",
@@ -124,7 +127,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
 
-    # گارد برای دکمه سطح
+    # گارد برای دکمه‌های سطح
     if data.startswith("lvl_"):
         return await handle_level(update, context)
 
@@ -189,9 +192,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["step"] = "name"
         await query.edit_message_text(
             rules_text,
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("✅ قبول دارم و ادامه", callback_data="accept_rules")]]
-            )
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ قبول دارم و ادامه", callback_data="accept_rules")]])
         )
         return
 
@@ -308,7 +309,6 @@ async def finalize_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary += f"\n📌 رویداد: {ev['title']}\n📍 مکان: {ev['place']}\n🕒 زمان: {ev['when']}\n"
     await update.effective_chat.send_message(summary)
 
-    # Send to admin group
     if GROUP_CHAT_ID:
         user_chat_id = update.effective_chat.id
         approve_cb = f"approve_{user_chat_id}_{ev_id or 'NA'}"
@@ -327,25 +327,43 @@ async def finalize_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data.clear()
 
+# =========================
+#  PTB App + FastAPI App
+# =========================
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
+# Handlers (ترتیب مهمه)
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("cancel", cancel))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^شروع مجدد 🔄$"), start))
+application.add_handler(MessageHandler(filters.TEXT & filters.Regex("^لغو عملیات ❌$"), cancel))
+application.add_handler(CallbackQueryHandler(handle_level, pattern=r"^lvl_"))  # باید قبل از عمومی باشد
+application.add_handler(CallbackQueryHandler(handle_callback))
+application.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^شروع مجدد 🔄$"), start))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^لغو عملیات ❌$"), cancel))
-    # ترتیب مهمه
-    app.add_handler(CallbackQueryHandler(handle_level, pattern=r"^lvl_"))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # init PTB + set webhook
+    await application.initialize()
+    if WEBHOOK_URL:
+        await application.bot.set_webhook(url=WEBHOOK_URL)
+    await application.start()
+    yield
+    await application.stop()
+    await application.shutdown()
 
-    print("CBot is running with polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+app = FastAPI(lifespan=lifespan)
 
+@app.post("/")
+async def webhook(request: Request):
+    body = await request.json()
+    update = Update.de_json(body, application.bot)
+    await application.process_update(update)
+    return {"status": "ok"}
 
-if __name__ == "__main__":
-    main()
+@app.get("/")
+async def root():
+    return {"status": "CBot (webhook) is running."}
